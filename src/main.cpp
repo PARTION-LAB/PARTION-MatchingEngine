@@ -25,6 +25,11 @@ constexpr const char* kTradeTopic = "partion.trade.events";
 
 volatile std::sig_atomic_t running = 1;
 
+enum class CommandType {
+    Create,
+    Cancel
+};
+
 void handle_signal(int) {
     running = 0;
 }
@@ -39,6 +44,11 @@ void set_conf(rd_kafka_conf_t* conf, const char* name, const std::string& value)
     if (rd_kafka_conf_set(conf, name, value.c_str(), error, sizeof(error)) != RD_KAFKA_CONF_OK) {
         throw std::runtime_error(std::string("Kafka config failed: ") + error);
     }
+}
+
+long long now_millis() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 long long parse_money_cents(const json& value) {
@@ -87,13 +97,14 @@ struct Trade {
     long long sell_order_id;
     long long price_cents;
     long long quantity;
+    long long occurred_at;
 };
 
 struct OrderCommand {
-    std::string command_type;
-    long long order_id;
-    long long product_id;
+    CommandType type;
     std::optional<Order> order;
+    long long product_id;
+    long long order_id;
 };
 
 class KafkaProducer {
@@ -124,7 +135,7 @@ public:
                 {"sellOrderId", trade.sell_order_id},
                 {"price", format_money(trade.price_cents)},
                 {"quantity", trade.quantity},
-                {"occurredAt", now_millis()}
+                {"occurredAt", trade.occurred_at}
         };
 
         std::string message = payload.dump();
@@ -147,11 +158,6 @@ public:
     }
 
 private:
-    static long long now_millis() {
-        using namespace std::chrono;
-        return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    }
-
     rd_kafka_t* producer_{nullptr};
 };
 
@@ -171,32 +177,30 @@ public:
     }
 
     bool cancel(long long order_id) {
-        return remove_from_book(buy_book_, order_id) || remove_from_book(sell_book_, order_id);
+        return cancel_from_book(buy_book_, order_id) || cancel_from_book(sell_book_, order_id);
     }
 
 private:
     template <typename Book>
-    bool remove_from_book(Book& book, long long order_id) {
-        for (auto level = book.begin(); level != book.end();) {
-            auto& orders = level->second;
-            bool removed = false;
-
-            for (auto order = orders.begin(); order != orders.end();) {
-                if (order->order_id == order_id) {
-                    order = orders.erase(order);
-                    removed = true;
-                } else {
-                    ++order;
+    bool cancel_from_book(Book& book, long long order_id) {
+        for (auto price_iterator = book.begin(); price_iterator != book.end(); ++price_iterator) {
+            auto& orders = price_iterator->second;
+            for (auto order_iterator = orders.begin(); order_iterator != orders.end(); ++order_iterator) {
+                if (order_iterator->order_id != order_id) {
+                    continue;
                 }
-            }
 
-            if (orders.empty()) {
-                level = book.erase(level);
-            } else {
-                ++level;
-            }
+                long long price = price_iterator->first;
+                long long remaining_quantity = order_iterator->remaining_quantity;
+                orders.erase(order_iterator);
 
-            if (removed) {
+                if (orders.empty()) {
+                    book.erase(price_iterator);
+                }
+
+                std::cout << "canceled orderId=" << order_id
+                          << " price=" << format_money(price)
+                          << " remainingQuantity=" << remaining_quantity << '\n';
                 return true;
             }
         }
@@ -266,14 +270,20 @@ private:
         const Order& buy = incoming.side == "BUY" ? incoming : resting;
         const Order& sell = incoming.side == "SELL" ? incoming : resting;
         ++trade_sequence_;
+        long long occurred_at = now_millis();
 
         return Trade{
-                std::to_string(buy.product_id) + "-" + std::to_string(trade_sequence_),
+                std::to_string(buy.product_id) + "-" +
+                        std::to_string(buy.order_id) + "-" +
+                        std::to_string(sell.order_id) + "-" +
+                        std::to_string(occurred_at) + "-" +
+                        std::to_string(trade_sequence_),
                 buy.product_id,
                 buy.order_id,
                 sell.order_id,
                 trade_price,
-                quantity
+                quantity,
+                occurred_at
         };
     }
 
@@ -293,13 +303,19 @@ public:
         iterator->second.accept(order);
     }
 
-    bool cancel(long long product_id, long long order_id) {
+    void cancel(long long product_id, long long order_id) {
         auto iterator = books_.find(product_id);
         if (iterator == books_.end()) {
-            return false;
+            std::cout << "cancel ignored. order book not found. productId=" << product_id
+                      << " orderId=" << order_id << '\n';
+            return;
         }
 
-        return iterator->second.cancel(order_id);
+        bool canceled = iterator->second.cancel(order_id);
+        if (!canceled) {
+            std::cout << "cancel ignored. order not found. productId=" << product_id
+                      << " orderId=" << order_id << '\n';
+        }
     }
 
 private:
@@ -307,34 +323,61 @@ private:
     std::unordered_map<long long, OrderBook> books_;
 };
 
-OrderCommand parse_order_command(const std::string& message, long long sequence) {
-    json payload = json::parse(message);
-    std::string command_type = payload.value("commandType", "NEW_ORDER");
-    long long order_id = payload.at("orderId").get<long long>();
-    long long product_id = payload.at("productId").get<long long>();
+CommandType parse_command_type(const json& payload) {
+    std::string command_type = payload.value("commandType", "CREATE");
+    if (command_type == "CREATE" || command_type == "NEW_ORDER") {
+        return CommandType::Create;
+    }
+    if (command_type == "CANCEL" || command_type == "CANCEL_ORDER") {
+        return CommandType::Cancel;
+    }
 
-    if (command_type == "CANCEL_ORDER") {
+    throw std::runtime_error("Unknown commandType: " + command_type);
+}
+
+Order parse_create_order(const json& payload, long long sequence) {
+    long long quantity = payload.at("quantity").get<long long>();
+    if (quantity <= 0) {
+        throw std::runtime_error("Order quantity must be positive.");
+    }
+
+    long long price_cents = parse_money_cents(payload.at("price"));
+    if (price_cents <= 0) {
+        throw std::runtime_error("Order price must be positive.");
+    }
+
+    return Order{
+            payload.at("orderId").get<long long>(),
+            payload.at("memberId").get<long long>(),
+            payload.at("productId").get<long long>(),
+            payload.at("side").get<std::string>(),
+            price_cents,
+            quantity,
+            sequence
+    };
+}
+
+OrderCommand parse_command(const std::string& message, long long sequence) {
+    json payload = json::parse(message);
+    CommandType command_type = parse_command_type(payload);
+
+    if (command_type == CommandType::Create) {
+        Order order = parse_create_order(payload, sequence);
         return OrderCommand{
                 command_type,
-                order_id,
-                product_id,
-                std::nullopt
+                order,
+                order.product_id,
+                order.order_id
         };
     }
 
+    long long product_id = payload.at("productId").get<long long>();
+    long long order_id = payload.at("orderId").get<long long>();
     return OrderCommand{
             command_type,
-            order_id,
+            std::nullopt,
             product_id,
-            Order{
-                    order_id,
-                    payload.at("memberId").get<long long>(),
-                    product_id,
-                    payload.at("side").get<std::string>(),
-                    parse_money_cents(payload.at("price")),
-                    payload.at("quantity").get<long long>(),
-                    sequence
-            }
+            order_id
     };
 }
 
@@ -370,11 +413,10 @@ rd_kafka_t* create_consumer(const std::string& brokers) {
 } // namespace
 
 int main() {
-    std::cout.setf(std::ios::unitbuf);
-    std::cerr.setf(std::ios::unitbuf);
-
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
 
     try {
         std::string brokers = env_or("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
@@ -401,31 +443,22 @@ int main() {
 
             try {
                 std::string payload(static_cast<char*>(message->payload), message->len);
-                OrderCommand command = parse_order_command(payload, ++sequence);
-
-                if (command.command_type == "CANCEL_ORDER") {
-                    bool removed = engine.cancel(command.product_id, command.order_id);
-                    std::cout << "received cancel orderId=" << command.order_id
-                              << " productId=" << command.product_id
-                              << " removed=" << (removed ? "true" : "false") << '\n';
-                    rd_kafka_message_destroy(message);
-                    continue;
+                OrderCommand command = parse_command(payload, ++sequence);
+                if (command.type == CommandType::Create) {
+                    Order order = command.order.value();
+                    std::cout << "received commandType=CREATE"
+                              << " orderId=" << order.order_id
+                              << " productId=" << order.product_id
+                              << " side=" << order.side
+                              << " price=" << format_money(order.price_cents)
+                              << " quantity=" << order.remaining_quantity << '\n';
+                    engine.accept(order);
+                } else if (command.type == CommandType::Cancel) {
+                    std::cout << "received commandType=CANCEL"
+                              << " orderId=" << command.order_id
+                              << " productId=" << command.product_id << '\n';
+                    engine.cancel(command.product_id, command.order_id);
                 }
-
-                if (command.command_type != "NEW_ORDER") {
-                    std::cerr << "Unknown order command type. commandType=" << command.command_type
-                              << " orderId=" << command.order_id << '\n';
-                    rd_kafka_message_destroy(message);
-                    continue;
-                }
-
-                Order order = command.order.value();
-                std::cout << "received orderId=" << order.order_id
-                          << " productId=" << order.product_id
-                          << " side=" << order.side
-                          << " price=" << format_money(order.price_cents)
-                          << " quantity=" << order.remaining_quantity << '\n';
-                engine.accept(order);
             } catch (const std::exception& exception) {
                 std::cerr << "Failed to process order message: " << exception.what() << '\n';
             }
