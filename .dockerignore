@@ -1,0 +1,7 @@
+.git
+.github
+.aws
+build
+cmake-build-*
+docker-compose.yml
+README.md
