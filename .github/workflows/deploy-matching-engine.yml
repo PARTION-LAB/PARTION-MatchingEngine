@@ -61,11 +61,48 @@ jobs:
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare task definition
+        run: |
+          ruby -rjson -e '
+            replacements = ENV.select { |key, _| key.start_with?("TASKDEF_") }
+                              .transform_keys { |key| "__#{key.delete_prefix("TASKDEF_")}__" }
+
+            replace = lambda do |value|
+              case value
+              when Hash
+                value.transform_values { |child| replace.call(child) }
+              when Array
+                value.map { |child| replace.call(child) }
+              when String
+                replacements.fetch(value, value)
+              else
+                value
+              end
+            end
+
+            task_definition = JSON.parse(File.read(ENV.fetch("ECS_TASK_DEFINITION")))
+            File.write("/tmp/task-definition.json", JSON.pretty_generate(replace.call(task_definition)))
+          '
+        env:
+          TASKDEF_MATCHING_ENGINE_DD_ENV: ${{ secrets.MATCHING_ENGINE_DD_ENV }}
+          TASKDEF_MATCHING_ENGINE_DD_SERVICE: ${{ secrets.MATCHING_ENGINE_DD_SERVICE }}
+          TASKDEF_MATCHING_ENGINE_DATADOG_DD_APM_ENABLED: ${{ secrets.MATCHING_ENGINE_DATADOG_DD_APM_ENABLED }}
+          TASKDEF_MATCHING_ENGINE_DATADOG_DD_APM_NON_LOCAL_TRAFFIC: ${{ secrets.MATCHING_ENGINE_DATADOG_DD_APM_NON_LOCAL_TRAFFIC }}
+          TASKDEF_MATCHING_ENGINE_DATADOG_DD_DOGSTATSD_NON_LOCAL_TRAFFIC: ${{ secrets.MATCHING_ENGINE_DATADOG_DD_DOGSTATSD_NON_LOCAL_TRAFFIC }}
+          TASKDEF_MATCHING_ENGINE_DATADOG_DD_ENV: ${{ secrets.MATCHING_ENGINE_DATADOG_DD_ENV }}
+          TASKDEF_MATCHING_ENGINE_DATADOG_DD_LOGS_ENABLED: ${{ secrets.MATCHING_ENGINE_DATADOG_DD_LOGS_ENABLED }}
+          TASKDEF_MATCHING_ENGINE_DATADOG_DD_SITE: ${{ secrets.MATCHING_ENGINE_DATADOG_DD_SITE }}
+          TASKDEF_MATCHING_ENGINE_DATADOG_ECS_FARGATE: ${{ secrets.MATCHING_ENGINE_DATADOG_ECS_FARGATE }}
+          TASKDEF_MATCHING_ENGINE_DD_API_KEY_SECRET_ARN: ${{ secrets.MATCHING_ENGINE_DD_API_KEY_SECRET_ARN }}
+          TASKDEF_MATCHING_ENGINE_EXECUTION_ROLE_ARN: ${{ secrets.MATCHING_ENGINE_EXECUTION_ROLE_ARN }}
+          TASKDEF_MATCHING_ENGINE_KAFKA_BOOTSTRAP_SERVERS: ${{ secrets.MATCHING_ENGINE_KAFKA_BOOTSTRAP_SERVERS }}
+          TASKDEF_MATCHING_ENGINE_KAFKA_GROUP_ID: ${{ secrets.MATCHING_ENGINE_KAFKA_GROUP_ID }}
+
       - name: Fill in the new image ID in the Amazon ECS task definition
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          task-definition: /tmp/task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ steps.build-image.outputs.image }}
 
@@ -76,4 +113,3 @@ jobs:
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
-
