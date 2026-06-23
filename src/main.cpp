@@ -1,4 +1,5 @@
 #include <csignal>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -75,7 +76,9 @@ struct Order {
     long long member_id;
     long long product_id;
     std::string side;
+    std::string order_method;
     long long price_cents;
+    long long original_quantity;
     long long remaining_quantity;
     long long sequence;
 };
@@ -118,6 +121,7 @@ public:
 
     void send_trade(const Trade& trade) {
         json payload = {
+                {"eventType", "TRADE_EXECUTED"},
                 {"eventId", trade.event_id},
                 {"productId", trade.product_id},
                 {"buyOrderId", trade.buy_order_id},
@@ -146,6 +150,51 @@ public:
         rd_kafka_poll(producer_, 0);
     }
 
+    void send_order_execution_result(const Order& order) {
+        long long filled_quantity = order.original_quantity - order.remaining_quantity;
+        long long canceled_quantity = order.remaining_quantity;
+        std::string final_status = "CANCELED";
+
+        if (filled_quantity == order.original_quantity) {
+            final_status = "FILLED";
+        } else if (filled_quantity > 0) {
+            final_status = "PARTIALLY_FILLED";
+        }
+
+        json payload = {
+                {"eventType", "ORDER_EXECUTION_RESULT"},
+                {"eventId", std::to_string(order.product_id) + "-" + std::to_string(order.order_id) + "-result"},
+                {"orderId", order.order_id},
+                {"productId", order.product_id},
+                {"side", order.side},
+                {"orderMethod", order.order_method},
+                {"requestedQuantity", order.original_quantity},
+                {"filledQuantity", filled_quantity},
+                {"canceledQuantity", canceled_quantity},
+                {"remainingQuantity", 0},
+                {"finalStatus", final_status},
+                {"occurredAt", now_millis()}
+        };
+
+        std::string message = payload.dump();
+        std::string key = std::to_string(order.product_id);
+
+        rd_kafka_resp_err_t error = rd_kafka_producev(
+                producer_,
+                RD_KAFKA_V_TOPIC(kTradeTopic),
+                RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+                RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
+                RD_KAFKA_V_VALUE(const_cast<char*>(message.data()), message.size()),
+                RD_KAFKA_V_END
+        );
+
+        if (error != RD_KAFKA_RESP_ERR_NO_ERROR) {
+            std::cerr << "Failed to produce order execution result event: " << rd_kafka_err2str(error) << '\n';
+        }
+
+        rd_kafka_poll(producer_, 0);
+    }
+
 private:
     static long long now_millis() {
         using namespace std::chrono;
@@ -161,12 +210,27 @@ public:
     }
 
     void accept(Order order) {
+        if (order.order_method != "LIMIT" && order.order_method != "MARKET") {
+            std::cerr << "Unknown order method. orderId=" << order.order_id
+                      << " orderMethod=" << order.order_method << '\n';
+            return;
+        }
+
         if (order.side == "BUY") {
             match_buy(order);
         } else if (order.side == "SELL") {
             match_sell(order);
         } else {
             std::cerr << "Unknown order side. orderId=" << order.order_id << '\n';
+            return;
+        }
+
+        if (order.order_method == "MARKET") {
+            producer_.send_order_execution_result(order);
+            std::cout << "finalized market orderId=" << order.order_id
+                      << " productId=" << order.product_id
+                      << " filled=" << (order.original_quantity - order.remaining_quantity)
+                      << " canceled=" << order.remaining_quantity << '\n';
         }
     }
 
@@ -217,7 +281,7 @@ private:
             }
         }
 
-        if (incoming.remaining_quantity > 0) {
+        if (incoming.remaining_quantity > 0 && incoming.order_method == "LIMIT") {
             buy_book_[incoming.price_cents].push_back(incoming);
         }
     }
@@ -235,7 +299,7 @@ private:
             }
         }
 
-        if (incoming.remaining_quantity > 0) {
+        if (incoming.remaining_quantity > 0 && incoming.order_method == "LIMIT") {
             sell_book_[incoming.price_cents].push_back(incoming);
         }
     }
@@ -309,7 +373,7 @@ private:
 
 OrderCommand parse_order_command(const std::string& message, long long sequence) {
     json payload = json::parse(message);
-    std::string command_type = payload.value("commandType", "NEW_ORDER");
+    std::string command_type = payload.value("commandType", std::string("NEW_ORDER"));
     long long order_id = payload.at("orderId").get<long long>();
     long long product_id = payload.at("productId").get<long long>();
 
@@ -322,6 +386,9 @@ OrderCommand parse_order_command(const std::string& message, long long sequence)
         };
     }
 
+    long long quantity = payload.at("quantity").get<long long>();
+    std::string order_method = payload.value("orderMethod", std::string("LIMIT"));
+
     return OrderCommand{
             command_type,
             order_id,
@@ -331,8 +398,10 @@ OrderCommand parse_order_command(const std::string& message, long long sequence)
                     payload.at("memberId").get<long long>(),
                     product_id,
                     payload.at("side").get<std::string>(),
+                    order_method,
                     parse_money_cents(payload.at("price")),
-                    payload.at("quantity").get<long long>(),
+                    quantity,
+                    quantity,
                     sequence
             }
     };
@@ -423,6 +492,7 @@ int main() {
                 std::cout << "received orderId=" << order.order_id
                           << " productId=" << order.product_id
                           << " side=" << order.side
+                          << " orderMethod=" << order.order_method
                           << " price=" << format_money(order.price_cents)
                           << " quantity=" << order.remaining_quantity << '\n';
                 engine.accept(order);
